@@ -1,0 +1,35 @@
+2026-04-06 15:18:22 === AutoCaptureAnalyze_Dump_V46 START (Tier-B) ===
+2026-04-06 15:18:22 PASS START
+2026-04-06 15:21:28 === AutoCaptureAnalyze_Dump_V47 START (Tier-B, PIDSAFE) ===
+2026-04-06 15:21:28 PASS START
+2026-04-06 15:21:43 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:27:29 FATAL: ProcDump not found. Dumps will not be captured.
+2026-04-06 15:27:29 === AutoCaptureAnalyze_Dump_V48 START (Tier-B, ProcDump-SAFE) ===
+2026-04-06 15:27:29 PASS START
+2026-04-06 15:27:44 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:27:44 ERROR: ProcDump unavailable. Skipping dump for PID=28352
+2026-04-06 15:27:44 PASS START
+2026-04-06 15:27:59 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:27:59 ERROR: ProcDump unavailable. Skipping dump for PID=28352
+2026-04-06 15:27:59 PASS START
+2026-04-06 15:28:14 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:28:14 ERROR: ProcDump unavailable. Skipping dump for PID=28352
+2026-04-06 15:28:14 PASS START
+2026-04-06 15:28:30 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:28:30 ERROR: ProcDump unavailable. Skipping dump for PID=28352
+2026-04-06 15:28:30 PASS START
+2026-04-06 15:28:45 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:28:45 ERROR: ProcDump unavailable. Skipping dump for PID=28352
+2026-04-06 15:28:45 PASS START
+2026-04-06 15:29:00 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:29:00 ERROR: ProcDump unavailable. Skipping dump for PID=28352
+2026-04-06 15:29:00 PASS START
+2026-04-06 15:29:15 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:29:15 ERROR: ProcDump unavailable. Skipping dump for PID=28352
+2026-04-06 15:29:15 PASS START
+2026-04-06 15:30:42 === AutoCaptureAnalyze_Dump_V48 START (Tier-B, ProcDump-SAFE) ===
+2026-04-06 15:30:42 PASS START
+2026-04-06 15:30:57 UIHANG DETECTED ProcId=28352 (SystemSettings)
+2026-04-06 15:40:44 === AutoCaptureAnalyze_Dump_V48 START (Tier-B, ProcDump-SAFE) ===
+2026-04-06 15:40:44 PASS START
+2026-04-06 15:41:00 UIHANG DETECTED ProcId=28352 (SystemSettings)

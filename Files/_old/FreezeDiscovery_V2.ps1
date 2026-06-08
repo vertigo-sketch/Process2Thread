@@ -1,0 +1,867 @@
+﻿<#
+.SYNOPSIS
+  FreezeDiscovery_Final - PS 5.1-safe evidence collector for file/app/system freezes.
+.DESCRIPTION
+  2026 best practices:
+  - PS 5.1 safe (no ?:, ??, ?., no inline-if expressions)
+  - StrictMode 2.0 safe (all vars initialized; no undefined variable reads)
+  - No "Lines" parameters anywhere (prevents empty-string binding failures)
+  - Best-effort collection with centralized error log; bundle always produced
+  - Vendor-defensible artifacts: raw + parsed fltmc outputs
+  - GlobalProtect-aware network capture (services, adapters, routes, DNS, SMB)
+  - Mixed volume format correlation (C:, \\?\Volume{GUID}\, \Device\HarddiskVolumeX)
+  - TicketSummary.txt with routing + confidence + copy/paste block
+
+.PARAMETER TargetPath
+  Optional file/folder path suspected to be locked/frozen (local or UNC).
+.PARAMETER CaseId
+  Optional ticket/case ID embedded in reports.
+.PARAMETER CaptureProcmon
+  If specified, capture Procmon trace (requires procmon.exe).
+.PARAMETER ProcmonSeconds
+  Procmon capture duration (5..600), default 30.
+.PARAMETER LookbackHours
+  System event lookback window in hours, default 48.
+.PARAMETER ToolRoot
+  Where handle.exe/procmon.exe live. Default: C:\Temp\Process2Thread
+.PARAMETER OutputRoot
+  Where bundles are written. Default: C:\Temp\Process2Thread\FreezeDiscovery
+.PARAMETER ExitCodeMode
+  If set, exits with 0 (success) or 1 (partial failure) for automation platforms.
+#>
+
+[CmdletBinding()]
+param(
+  [string]$TargetPath,
+  [string]$CaseId,
+  [switch]$CaptureProcmon,
+  [ValidateRange(5,600)]
+  [int]$ProcmonSeconds = 30,
+  [ValidateRange(1,720)]
+  [int]$LookbackHours = 48,
+  [string]$ToolRoot   = "C:\Temp\Process2Thread",
+  [string]$OutputRoot = "C:\Temp\Process2Thread\FreezeDiscovery",
+  [switch]$ExitCodeMode
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# StrictMode-safe main variables
+# -----------------------------
+$bundle = $null
+$zip = $null
+$errFile = $null
+$partialFailure = $false
+
+$isAdmin = $false
+$sys = $null
+$net = $null
+$gp  = $null
+
+$rawF = @()
+$rawI = @()
+$filters = @()
+$instances = @()
+$events = @()
+
+$targetCtx = $null
+$volCorr = $null
+
+$handleExe  = $null
+$procmonExe = $null
+$handleOut  = $null
+$procmonPml = $null
+
+# -----------------------------
+# Utilities (no Lines parameters)
+# -----------------------------
+function Ensure-Folder {
+  param([Parameter(Mandatory=$true)][string]$Path)
+  if (-not (Test-Path $Path)) {
+    New-Item -Path $Path -ItemType Directory -Force | Out-Null
+  }
+}
+
+function New-BundleFolder {
+  param([Parameter(Mandatory=$true)][string]$Root)
+  Ensure-Folder -Path $Root
+  $stamp  = (Get-Date).ToString("yyyyMMdd_HHmmss")
+  $folder = Join-Path $Root ("Bundle_{0}" -f $stamp)
+  Ensure-Folder -Path $folder
+  return $folder
+}
+
+function Write-Err {
+  param([Parameter(Mandatory=$true)][string]$Path, [Parameter(Mandatory=$true)][string]$Message)
+  $ts = (Get-Date).ToString("o")
+  ("[{0}] {1}" -f $ts, $Message) | Out-File -FilePath $Path -Encoding UTF8 -Append -Force
+}
+
+function Write-Json {
+  param([Parameter(Mandatory=$true)][string]$Path, [Parameter(Mandatory=$true)]$Object, [int]$Depth = 10)
+  $Object | ConvertTo-Json -Depth $Depth | Out-File -FilePath $Path -Encoding UTF8 -Force
+}
+
+function Sanitize-Lines {
+  param([Parameter(Mandatory=$true)][string[]]$InputLines)
+  # Replace null/empty lines with a single space to avoid any "empty string not allowed" traps.
+  $safe = @()
+  foreach ($l in $InputLines) {
+    if ($null -eq $l) { $safe += " " }
+    elseif ([string]$l -eq "") { $safe += " " }
+    else { $safe += [string]$l }
+  }
+  return ,$safe
+}
+
+function Write-TextDirect {
+  param([Parameter(Mandatory=$true)][string]$Path, [Parameter(Mandatory=$true)][string[]]$Lines)
+  (Sanitize-Lines -InputLines $Lines) | Out-File -FilePath $Path -Encoding UTF8 -Force
+}
+
+function Get-TextOrDefault {
+  param([Parameter(Mandatory=$true)]$Value, [Parameter(Mandatory=$true)][string]$Default)
+  if ($null -eq $Value) { return $Default }
+  $s = [string]$Value
+  if ([string]::IsNullOrWhiteSpace($s)) { return $Default }
+  return $s
+}
+
+function Normalize-VolString {
+  param([string]$v)
+  if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+  $s = $v.Trim()
+  if ($s.EndsWith("\")) { $s = $s.TrimEnd("\") }
+  return $s
+}
+
+function AltToNumber {
+  param([string]$alt)
+  try { return [double]$alt } catch { return -1 }
+}
+
+function Test-IsAdmin {
+  try {
+    return ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch { return $false }
+}
+
+function Find-Tool {
+  param([Parameter(Mandatory=$true)][string]$FileName, [Parameter(Mandatory=$true)][string]$ToolRoot)
+
+  $candidates = @(
+    (Join-Path $ToolRoot $FileName),
+    (Join-Path $PSScriptRoot $FileName),
+    "$env:ProgramFiles\Sysinternals\$FileName",
+    "$env:ProgramFiles(x86)\Sysinternals\$FileName"
+  )
+  $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+# Best-practice wrappers: return values, no scope side-effects.
+function Try-Get {
+  param([Parameter(Mandatory=$true)][string]$Name, [Parameter(Mandatory=$true)][scriptblock]$Script, [Parameter(Mandatory=$true)][string]$ErrFile)
+  try {
+    return & $Script
+  } catch {
+    Write-Err -Path $ErrFile -Message ("[{0}] {1}" -f $Name, $_.Exception.Message)
+    $script:partialFailure = $true
+    return $null
+  }
+}
+
+function Try-Do {
+  param([Parameter(Mandatory=$true)][string]$Name, [Parameter(Mandatory=$true)][scriptblock]$Script, [Parameter(Mandatory=$true)][string]$ErrFile)
+  try {
+    & $Script | Out-Null
+    return $true
+  } catch {
+    Write-Err -Path $ErrFile -Message ("[{0}] {1}" -f $Name, $_.Exception.Message)
+    $script:partialFailure = $true
+    return $false
+  }
+}
+
+# -----------------------------
+# Collectors
+# -----------------------------
+function Get-SystemInfo {
+  $os = Get-CimInstance Win32_OperatingSystem
+  $bios = Get-CimInstance Win32_BIOS
+  [pscustomobject]@{
+    ComputerName = $env:COMPUTERNAME
+    UserName     = $env:USERNAME
+    TimeLocal    = (Get-Date).ToString("o")
+    OS           = $os   | Select-Object Caption, Version, BuildNumber
+    BIOS         = $bios | Select-Object Manufacturer, SMBIOSBIOSVersion, ReleaseDate
+  }
+}
+
+function Get-ProcessSnapshotTop {
+  Get-Process |
+    Select-Object Name, Id,
+      @{Name="CPUSeconds";Expression={ if ($null -eq $_.CPU) { 0 } else { [double]$_.CPU } }},
+      @{Name="WorkingSetMB";Expression={ [math]::Round($_.WorkingSet64 / 1MB, 1) }},
+      @{Name="Handles";Expression={ $_.Handles }},
+      @{Name="Threads";Expression={ $_.Threads.Count }},
+      Responding |
+    Sort-Object -Property CPUSeconds -Descending |
+    Select-Object -First 30
+}
+
+function Get-LogicalDisks {
+  Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID, DriveType, Size, FreeSpace
+}
+
+function Get-NetworkSnapshot {
+  $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
+  $routes = Get-NetRoute -ErrorAction SilentlyContinue | Sort-Object -Property RouteMetric
+
+  $dns = $null
+  try { $dns = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue } catch { }
+
+  $smb = $null
+  try { $smb = Get-SmbConnection -ErrorAction SilentlyContinue } catch { }
+
+  [pscustomobject]@{
+    UpAdapters     = $adapters | Select-Object Name, InterfaceDescription, Status, LinkSpeed, MacAddress
+    DefaultRoutes  = $routes | Where-Object { $_.DestinationPrefix -eq "0.0.0.0/0" } | Select-Object InterfaceAlias, NextHop, RouteMetric
+    RouteSample    = $routes | Select-Object -First 80 InterfaceAlias, DestinationPrefix, NextHop, RouteMetric
+    DnsServers     = $dns | Select-Object InterfaceAlias, ServerAddresses
+    SmbConnections = $smb | Select-Object ServerName, ShareName, UserName, Dialect, NumOpens, EncryptData
+  }
+}
+
+function Get-GlobalProtectSnapshot {
+  $svc = @()
+  foreach ($name in @("PanGPS","PanGPA")) { try { $svc += Get-Service -Name $name -ErrorAction Stop } catch { } }
+
+  $adapters = @()
+  try {
+    $adapters = Get-NetAdapter -ErrorAction SilentlyContinue |
+      Where-Object { $_.InterfaceDescription -match "PANGP|GlobalProtect|PAN" -or $_.Name -match "PANGP|GlobalProtect|PAN" }
+  } catch { }
+
+  $routes = $null
+  try { $routes = Get-NetRoute -ErrorAction SilentlyContinue | Sort-Object -Property RouteMetric } catch { }
+
+  $dns = $null
+  try { $dns = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue } catch { }
+
+  $smb = $null
+  try { $smb = Get-SmbConnection -ErrorAction SilentlyContinue } catch { }
+
+  [pscustomobject]@{
+    Services       = $svc | Select-Object Name, Status, StartType
+    Adapters       = $adapters | Select-Object Name, InterfaceDescription, Status, LinkSpeed, MacAddress
+    DefaultRoutes  = $routes | Where-Object { $_.DestinationPrefix -eq "0.0.0.0/0" } | Select-Object InterfaceAlias, NextHop, RouteMetric
+    RouteSample    = $routes | Select-Object -First 80 InterfaceAlias, DestinationPrefix, NextHop, RouteMetric
+    DnsServers     = $dns | Select-Object InterfaceAlias, ServerAddresses
+    SmbConnections = $smb | Select-Object ServerName, ShareName, UserName, Dialect, NumOpens, EncryptData
+    Notes          = @("GlobalProtect snapshot captured.")
+  }
+}
+
+function Get-RelevantSystemEvents {
+  param([int]$LookbackHours)
+  $since = (Get-Date).AddHours(-1 * $LookbackHours)
+  $ids = 41,107,137,129,153
+  Get-WinEvent -FilterHashtable @{ LogName="System"; StartTime=$since; Id=$ids } -ErrorAction SilentlyContinue |
+    Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message
+}
+
+# fltmc
+function Get-FltmcRaw {
+  param([ValidateSet("filters","instances")][string]$Mode)
+  return ,(& fltmc $Mode 2>&1)
+}
+
+function Parse-FltmcFilters {
+  param([string[]]$Lines)
+  if (-not $Lines -or $Lines.Count -lt 4) { return @() }
+  $rows = $Lines | Select-Object -Skip 3 | Where-Object { $_.Trim() -ne "" }
+  $out = @()
+  foreach ($r in $rows) {
+    $p = ($r -split "\s{2,}").Trim()
+    if ($p.Count -ge 4) { $out += [pscustomobject]@{ FilterName=$p[0]; Instances=[int]$p[1]; Altitude=$p[2]; Frame=$p[3] } }
+  }
+  return $out
+}
+
+function Parse-FltmcInstances {
+  param([string[]]$Lines)
+  if (-not $Lines -or $Lines.Count -lt 4) { return @() }
+  $rows = $Lines | Select-Object -Skip 3 | Where-Object { $_.Trim() -ne "" }
+  $out = @()
+  foreach ($r in $rows) {
+    $p = ($r -split "\s{2,}").Trim()
+    if ($p.Count -ge 4) { $out += [pscustomobject]@{ FilterName=$p[0]; Volume=$p[1]; Instance=$p[2]; Altitude=$p[3] } }
+  }
+  return $out
+}
+
+# Target context + correlation
+function Resolve-TargetContext {
+  param([string]$TargetPath)
+
+  $ctx = [ordered]@{
+    TargetPath = $TargetPath
+    PathType   = "None"
+    LocalDrive = $null
+    VolumeGuid = $null
+    UncServer  = $null
+    UncShare   = $null
+  }
+
+  if ([string]::IsNullOrWhiteSpace($TargetPath)) { return [pscustomobject]$ctx }
+
+  if ($TargetPath -match '^[\\]{2}([^\\]+)\\([^\\]+)') {
+    $ctx.PathType="UNC"; $ctx.UncServer=$matches[1]; $ctx.UncShare=$matches[2]
+    return [pscustomobject]$ctx
+  }
+
+  $qual = $null
+  try { $qual = Split-Path -Path $TargetPath -Qualifier } catch { }
+  if ($qual -and $qual -match "^[A-Za-z]:$") {
+    $ctx.PathType="Local"; $ctx.LocalDrive=$qual.ToUpper()
+    try {
+      $vol = Get-CimInstance Win32_Volume -Filter ("DriveLetter='{0}'" -f $ctx.LocalDrive) -ErrorAction Stop
+      if ($vol -and $vol.DeviceID) { $ctx.VolumeGuid = [string]$vol.DeviceID }
+    } catch { }
+    return [pscustomobject]$ctx
+  }
+
+  $ctx.PathType="Unknown"
+  return [pscustomobject]$ctx
+}
+
+function Build-VolumeCorrelation {
+  param($TargetCtx, [object[]]$Filters, [object[]]$Instances)
+
+  $vc = [ordered]@{
+    CorrelatedVolume        = $null
+    MatchedInstances        = @()
+    FilterNamesOnTarget     = @()
+    FiltersOnTarget         = @()
+    DevicePathInstancesAlso = @()
+    Notes                  = @()
+  }
+
+  if ($TargetCtx.PathType -ne "Local") {
+    $vc.CorrelatedVolume = $TargetCtx.PathType
+    $vc.Notes += "Not a local target; local volume correlation not applicable."
+    return [pscustomobject]$vc
+  }
+
+  $driveNorm = Normalize-VolString $TargetCtx.LocalDrive
+  $guidNorm = $null
+  if ($TargetCtx.VolumeGuid) { $guidNorm = Normalize-VolString $TargetCtx.VolumeGuid }
+
+  $vc.CorrelatedVolume = $driveNorm
+
+  $matched = @()
+  foreach ($inst in @($Instances)) {
+    $vnorm = Normalize-VolString $inst.Volume
+    if ($null -eq $vnorm) { continue }
+    if ($vnorm -eq $driveNorm) { $matched += $inst; continue }
+    if ($guidNorm) {
+      if ($vnorm -eq $guidNorm) { $matched += $inst; continue }
+      if ($vnorm -eq ($guidNorm.TrimEnd("\"))) { $matched += $inst; continue }
+    }
+  }
+  $vc.MatchedInstances = $matched
+
+  $names = @()
+  if ($matched.Count -gt 0) {
+    $names = $matched | Select-Object -ExpandProperty FilterName -ErrorAction SilentlyContinue | Sort-Object -Unique
+  }
+  $vc.FilterNamesOnTarget = $names
+
+  $flt = @()
+  if ($names.Count -gt 0) { $flt = @($Filters | Where-Object { $names -contains $_.FilterName }) }
+  $vc.FiltersOnTarget = $flt | Sort-Object -Property @{Expression={ AltToNumber $_.Altitude }; Descending=$true}
+
+  if ($names.Count -gt 0) {
+    $vc.DevicePathInstancesAlso = @(
+      $Instances | Where-Object { ($names -contains $_.FilterName) -and ($_.Volume -like "\Device\HarddiskVolume*") }
+    )
+    if ($vc.DevicePathInstancesAlso.Count -gt 0) {
+      $vc.Notes += "Device-path instances present for filters on target (mixed fltmc formats observed)."
+    }
+  }
+
+  if ($matched.Count -eq 0) {
+    $vc.Notes += "No instances matched by drive-letter/GUID. Review fltmc_instances_raw.txt; system may report only device paths."
+  }
+
+  return [pscustomobject]$vc
+}
+
+# Optional tools
+function Run-HandleSearch {
+  param([string]$HandleExe, [string]$TargetPath, [string]$OutFile)
+  & $HandleExe -accepteula $TargetPath 2>&1 | Out-File -FilePath $OutFile -Encoding UTF8 -Force
+}
+
+function Run-ProcmonCapture {
+  param([string]$ProcmonExe, [string]$OutFolder, [int]$Seconds)
+  $pml = Join-Path $OutFolder "ProcmonTrace.pml"
+  $argsStart = "/AcceptEula /Quiet /Minimized /BackingFile `"$pml`""
+  Start-Process -FilePath $ProcmonExe -ArgumentList $argsStart -WindowStyle Hidden | Out-Null
+  Start-Sleep -Seconds $Seconds
+  Start-Process -FilePath $ProcmonExe -ArgumentList "/Terminate" -WindowStyle Hidden -Wait | Out-Null
+  return $pml
+}
+
+# -----------------------------
+# Ticket summary with routing confidence
+# -----------------------------
+function Compute-Routing {
+  param(
+    $TargetCtx,
+    $Gp,
+    [object[]]$Events
+  )
+
+  $pathType = Get-TextOrDefault $TargetCtx.PathType "<unknown>"
+  $isUNC = ($pathType -eq "UNC")
+  $isLocal = ($pathType -eq "Local")
+
+  $storTimeout = $false
+  $powerHints = $false
+  try {
+    if ($Events) {
+      if (@($Events | Where-Object { $_.Id -eq 129 -or $_.Id -eq 153 }).Count -gt 0) { $storTimeout = $true }
+      if (@($Events | Where-Object { $_.Id -eq 41 -or $_.Id -eq 107 -or $_.Id -eq 137 }).Count -gt 0) { $powerHints = $true }
+    }
+  } catch { }
+
+  $gpUp = $false
+  $gpAdapterUp = $false
+  $gpSmb = $false
+  try {
+    if ($Gp -ne $null) {
+      # services running?
+      if ($Gp.Services) {
+        if (@($Gp.Services | Where-Object { $_.Status -eq "Running" }).Count -gt 0) { $gpUp = $true }
+      }
+      # adapter up?
+      if ($Gp.Adapters) {
+        if (@($Gp.Adapters | Where-Object { $_.Status -eq "Up" }).Count -gt 0) { $gpAdapterUp = $true }
+      }
+      # smb connections present?
+      if ($Gp.SmbConnections) {
+        if (@($Gp.SmbConnections | Where-Object { $_.ServerName }).Count -gt 0) { $gpSmb = $true }
+      }
+    }
+  } catch { }
+
+  $queue = "Endpoint/Platform"
+  $reason = "General: insufficient signals; review bundle evidence."
+  $confidence = "Low"
+
+  if ($isUNC) {
+    $queue = "Network/VPN (GlobalProtect) / File Services"
+    $reason = "Target is UNC path; prioritize VPN routes/DNS and SMB connectivity/server-side locks."
+    # confidence for UNC is higher if GP is clearly active
+    if ($gpUp -or $gpAdapterUp) { $confidence = "High" } else { $confidence = "Medium" }
+  } elseif ($storTimeout) {
+    $queue = "Endpoint/Platform (Storage) + Security (Filters)"
+    $reason = "Event 129/153 indicates storage timeout/reset; common with storage stack, filter drivers, firmware."
+    $confidence = "High"
+  } elseif ($powerHints) {
+    $queue = "Endpoint/Platform (Power/Resume) + Storage"
+    $reason = "Power/resume indicators (41/107/137) suggest sleep/hibernate resume path correlation."
+    $confidence = "Medium"
+  } elseif ($isLocal) {
+    $queue = "Endpoint/Platform / Security (Minifilters)"
+    $reason = "Local path; if user-mode handle owner isnâ€™t clear, minifilters/storage stack are common culprits."
+    $confidence = "Medium"
+  }
+
+  # Add a "boost" if multiple strong signals exist
+  if ($isUNC -and $gpSmb) { $confidence = "High" }
+
+  return [pscustomobject]@{
+    Queue = $queue
+    Reason = $reason
+    Confidence = $confidence
+    Signals = [pscustomobject]@{
+      IsUNC = $isUNC
+      IsLocal = $isLocal
+      StorageTimeout = $storTimeout
+      PowerHints = $powerHints
+      GlobalProtectService = $gpUp
+      GlobalProtectAdapter = $gpAdapterUp
+      SmbConnections = $gpSmb
+    }
+  }
+}
+
+function Write-TicketSummary {
+  param(
+    [string]$Path,
+    [string]$CaseId,
+    [string]$TargetPath,
+    $TargetCtx,
+    $VolCorr,
+    [object[]]$Events,
+    [bool]$IsAdmin,
+    $Routing,
+    [string]$ZipPath
+  )
+
+  $tp = Get-TextOrDefault $TargetPath "<none>"
+  $pathType = Get-TextOrDefault $TargetCtx.PathType "<unknown>"
+  $vol = Get-TextOrDefault $VolCorr.CorrelatedVolume "<n/a>"
+
+  # Copy/paste block for ticket description
+  $paste = @()
+  $paste += ("Freeze issue reported. TargetPath={0}; PathType={1}; AdminCapture={2}" -f $tp, $pathType, $IsAdmin)
+  $paste += ("Routing: {0} (Confidence: {1})" -f $Routing.Queue, $Routing.Confidence)
+  $paste += ("Reason: {0}" -f $Routing.Reason)
+  $paste += ("Bundle: {0}" -f $ZipPath)
+
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("TICKET SUMMARY (FreezeDiscovery)")
+  $lines.Add("================================")
+  if ($CaseId) { $lines.Add("Case/Ticket: " + $CaseId) }
+  $lines.Add("Generated: " + (Get-Date).ToString("o"))
+  $lines.Add("Admin/Elevated: " + $IsAdmin)
+  $lines.Add("")
+
+  $lines.Add("COPY/PASTE (Ticket Description)")
+  $lines.Add("------------------------------")
+  foreach ($p in $paste) { $lines.Add($p) }
+  $lines.Add("")
+
+  $lines.Add("1) Scope / Target")
+  $lines.Add("   TargetPath: " + $tp)
+  $lines.Add("   PathType:   " + $pathType)
+  if ($pathType -eq "Local") { $lines.Add("   Volume:     " + $vol) }
+  $lines.Add("")
+
+  $lines.Add("2) Routing Recommendation")
+  $lines.Add("   Queue:      " + $Routing.Queue)
+  $lines.Add("   Confidence: " + $Routing.Confidence)
+  $lines.Add("   Reason:     " + $Routing.Reason)
+  $lines.Add("")
+
+  $lines.Add("3) Key Signals")
+  $lines.Add("   UNC/VPN suspected: " + $Routing.Signals.IsUNC)
+  $lines.Add("   Storage timeouts (129/153): " + $Routing.Signals.StorageTimeout)
+  $lines.Add("   Power/resume hints (41/107/137): " + $Routing.Signals.PowerHints)
+  $lines.Add("   GP service running: " + $Routing.Signals.GlobalProtectService)
+  $lines.Add("   GP adapter up:      " + $Routing.Signals.GlobalProtectAdapter)
+  $lines.Add("   SMB sessions seen:  " + $Routing.Signals.SmbConnections)
+  $lines.Add("")
+
+  $lines.Add("4) Evidence Included (Attach These)")
+  $lines.Add("   - VendorReport.md / VendorReport.txt")
+  $lines.Add("   - Summary_Human.txt")
+  $lines.Add("   - SystemEvents_*h.csv (IDs 129/153, 41/107/137)")
+  $lines.Add("   - fltmc_filters_raw.txt + fltmc_instances_raw.txt")
+  $lines.Add("   - MiniFilters.json + MiniFilterInstances.json")
+  $lines.Add("   - VolumeCorrelation.json + TargetContext.json")
+  $lines.Add("   - Network.json + GlobalProtect.json (routes/DNS/SMB)")
+  $lines.Add("   - HandleSearch.txt (if present) and/or ProcmonTrace.pml (if captured)")
+  $lines.Add("")
+
+  $lines.Add("5) Recommended Repro / Next Steps (Tier-1 Safe)")
+  if ($Routing.Signals.IsUNC) {
+    $lines.Add("   - Repro once with VPN DISCONNECTED (if policy allows). Capture a second bundle and compare GlobalProtect/Network snapshots.")
+    $lines.Add("   - Validate SMB reachability and DNS behavior; confirm server/share availability.")
+  } else {
+    $lines.Add("   - If repeatable: run capture during repro with -CaptureProcmon -ProcmonSeconds 30 (keep short).")
+    if ($Routing.Signals.StorageTimeout) { $lines.Add("   - Emphasize Event 129/153 timing + filter list on correlated volume when escalating.") }
+    if ($Routing.Signals.PowerHints)     { $lines.Add("   - Confirm if this starts after sleep/hibernate; compare to cold boot behavior.") }
+  }
+  $lines.Add("")
+
+  $lines.Add("6) Bundle Location")
+  $lines.Add("   Zip: " + (Get-TextOrDefault $ZipPath "<unknown>"))
+
+  Write-TextDirect -Path $Path -Lines $lines.ToArray()
+}
+
+# -----------------------------
+# Human + Vendor reports (minimal but solid)
+# -----------------------------
+function Write-HumanSummary {
+  param(
+    [string]$Path,
+    $Sys,
+    $TargetCtx,
+    $VolCorr,
+    [object[]]$Events,
+    [bool]$IsAdmin,
+    [string]$CaseId,
+    $Routing
+  )
+
+  $cn = "<unknown>"
+  $un = "<unknown>"
+  if ($Sys) {
+    $cn = Get-TextOrDefault $Sys.ComputerName "<unknown>"
+    $un = Get-TextOrDefault $Sys.UserName "<unknown>"
+  }
+
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("FreezeDiscovery - Human Summary")
+  $lines.Add("----------------------------------------")
+  if ($CaseId) { $lines.Add("Case/Ticket: " + $CaseId) }
+  $lines.Add("Generated: " + (Get-Date).ToString("o"))
+  $lines.Add("Computer: " + $cn + "   User: " + $un)
+  $lines.Add("Admin context: " + $IsAdmin)
+  $lines.Add("")
+
+  $lines.Add("Target:")
+  $lines.Add("  Path: " + (Get-TextOrDefault $TargetCtx.TargetPath "<none>"))
+  $lines.Add("  Type: " + (Get-TextOrDefault $TargetCtx.PathType "<unknown>"))
+  if ($TargetCtx.PathType -eq "Local") {
+    $lines.Add("  Drive: " + (Get-TextOrDefault $TargetCtx.LocalDrive "<unknown>"))
+    if ($TargetCtx.VolumeGuid) { $lines.Add("  Volume GUID: " + $TargetCtx.VolumeGuid) }
+  } elseif ($TargetCtx.PathType -eq "UNC") {
+    $lines.Add(("  UNC: \\{0}\{1}" -f (Get-TextOrDefault $TargetCtx.UncServer "<unknown>"), (Get-TextOrDefault $TargetCtx.UncShare "<unknown>")))
+  }
+  $lines.Add("")
+
+  $lines.Add("Routing:")
+  $lines.Add("  Queue: " + $Routing.Queue)
+  $lines.Add("  Confidence: " + $Routing.Confidence)
+  $lines.Add("  Reason: " + $Routing.Reason)
+  $lines.Add("")
+
+  if ($TargetCtx.PathType -eq "Local") {
+    $lines.Add("Volume Correlation:")
+    $lines.Add("  Correlated volume: " + (Get-TextOrDefault $VolCorr.CorrelatedVolume "<unknown>"))
+    $lines.Add("  Matched instances: " + @($VolCorr.MatchedInstances).Count)
+    $lines.Add("  Filters on target: " + @($VolCorr.FiltersOnTarget).Count)
+    if ($VolCorr.DevicePathInstancesAlso -and $VolCorr.DevicePathInstancesAlso.Count -gt 0) {
+      $lines.Add("  Device-path instances also present: " + @($VolCorr.DevicePathInstancesAlso).Count)
+    }
+    $lines.Add("")
+  }
+
+  $stor = @($Events | Where-Object { $_.Id -eq 129 -or $_.Id -eq 153 } | Select-Object -First 5)
+  if ($stor.Count -gt 0) {
+    $lines.Add("Storage Timeout Indicators (sample):")
+    foreach ($e in $stor) { $lines.Add(("  - {0} | ID {1} | {2}" -f $e.TimeCreated, $e.Id, $e.ProviderName)) }
+    $lines.Add("")
+  }
+
+  Write-TextDirect -Path $Path -Lines $lines.ToArray()
+}
+
+function Write-VendorReport {
+  param(
+    [string]$MdPath,
+    [string]$TxtPath,
+    $Sys,
+    $TargetCtx,
+    $VolCorr,
+    [object[]]$Filters,
+    [object[]]$Instances,
+    [object[]]$Events,
+    [bool]$IsAdmin,
+    [string]$CaseId,
+    [string]$HandleSearchPath,
+    [string]$ProcmonPath,
+    $Routing,
+    [int]$LookbackHours
+  )
+
+  $cn = "<unknown>"
+  $un = "<unknown>"
+  $osLine = "<unknown>"
+  $biosLine = "<unknown>"
+  if ($Sys) {
+    $cn = Get-TextOrDefault $Sys.ComputerName "<unknown>"
+    $un = Get-TextOrDefault $Sys.UserName "<unknown>"
+    if ($Sys.OS)   { $osLine = ("{0} {1} (Build {2})" -f $Sys.OS.Caption, $Sys.OS.Version, $Sys.OS.BuildNumber) }
+    if ($Sys.BIOS) { $biosLine = ("{0} {1}" -f $Sys.BIOS.Manufacturer, $Sys.BIOS.SMBIOSBIOSVersion) }
+  }
+
+  $md = New-Object System.Collections.Generic.List[string]
+  $md.Add("# Vendor Diagnostic Report - FreezeDiscovery")
+  $md.Add("")
+  if ($CaseId) { $md.Add(("**Case/Ticket:** {0}  " -f $CaseId)) }
+  $md.Add(("**Generated:** {0}  " -f (Get-Date).ToString("o")))
+  $md.Add(("**Admin context:** {0}  " -f $IsAdmin))
+  $md.Add("")
+
+  $md.Add("## 1. Executive Summary")
+  $md.Add(("- Routing: {0} (Confidence: {1})" -f $Routing.Queue, $Routing.Confidence))
+  $md.Add(("- Reason: {0}" -f $Routing.Reason))
+  $md.Add("")
+
+  $md.Add("## 2. Environment")
+  $md.Add(("- **ComputerName:** {0}" -f $cn))
+  $md.Add(("- **UserName:** {0}" -f $un))
+  $md.Add(("- **OS:** {0}" -f $osLine))
+  $md.Add(("- **BIOS:** {0}" -f $biosLine))
+  $md.Add("")
+
+  $md.Add("## 3. Target Context")
+  $md.Add(("- **TargetPath:** {0}" -f (Get-TextOrDefault $TargetCtx.TargetPath "<none>")))
+  $md.Add(("- **PathType:** {0}" -f (Get-TextOrDefault $TargetCtx.PathType "<unknown>")))
+  $md.Add("")
+
+  $md.Add("## 4. Minifilter Evidence")
+  $md.Add(("- Loaded minifilters (parsed): {0}" -f (@($Filters).Count)))
+  $md.Add(("- Instances (parsed): {0}" -f (@($Instances).Count)))
+  $md.Add("")
+
+  if ($TargetCtx.PathType -eq "Local") {
+    $md.Add(("### 4.1 Correlation to volume {0}" -f (Get-TextOrDefault $VolCorr.CorrelatedVolume "<unknown>")))
+    $md.Add(("- Matched instances: {0}" -f (@($VolCorr.MatchedInstances).Count)))
+    $md.Add(("- Filters on target: {0}" -f (@($VolCorr.FiltersOnTarget).Count)))
+    $md.Add("")
+    if ($VolCorr.FiltersOnTarget -and $VolCorr.FiltersOnTarget.Count -gt 0) {
+      $md.Add("| FilterName | Altitude |")
+      $md.Add("|---|---:|")
+      foreach ($flt in $VolCorr.FiltersOnTarget) {
+        $md.Add(("| {0} | {1} |" -f $flt.FilterName, $flt.Altitude))
+      }
+    } else {
+      $md.Add("_No filters correlated by drive-letter/GUID. Review raw fltmc outputs._")
+    }
+    $md.Add("")
+  } else {
+    $md.Add("### 4.1 UNC note")
+    $md.Add("_UNC targets do not map to local volumes via fltmc instances. Focus on VPN/SMB path and server-side locking._")
+    $md.Add("")
+  }
+
+  $md.Add(("## 5. Event Log Correlation (LookbackHours={0})" -f $LookbackHours))
+  $stor = @($Events | Where-Object { $_.Id -eq 129 -or $_.Id -eq 153 } | Select-Object -First 20)
+  if ($stor.Count -gt 0) {
+    foreach ($e in $stor) { $md.Add(("- {0} | ID {1} | {2}" -f $e.TimeCreated, $e.Id, $e.ProviderName)) }
+  } else {
+    $md.Add("_No 129/153 events found in capture window._")
+  }
+  $md.Add("")
+
+  $md.Add("## 6. Attachments Included")
+  $md.Add("- VendorReport.md / VendorReport.txt")
+  $md.Add("- TicketSummary.txt")
+  $md.Add("- Summary_Human.txt")
+  $md.Add("- Network.json / GlobalProtect.json")
+  $md.Add("- fltmc_filters_raw.txt / fltmc_instances_raw.txt")
+  $md.Add("- MiniFilters.json / MiniFilterInstances.json")
+  $md.Add("- TargetContext.json / VolumeCorrelation.json")
+  $md.Add("- SystemEvents_*h.csv / powercfg_lastwake.txt")
+  if ($HandleSearchPath -and (Test-Path $HandleSearchPath)) { $md.Add("- HandleSearch.txt") }
+  if ($ProcmonPath -and (Test-Path $ProcmonPath)) { $md.Add("- ProcmonTrace.pml") }
+  $md.Add("")
+
+  $mdText = ($md -join "`r`n")
+  $mdText | Out-File -FilePath $MdPath -Encoding UTF8 -Force
+  ($mdText -replace "\*\*", "" -replace "_", "" -replace "\|", " ") | Out-File -FilePath $TxtPath -Encoding UTF8 -Force
+}
+
+# -----------------------------
+# MAIN
+# -----------------------------
+$bundle = New-BundleFolder -Root $OutputRoot
+$errFile = Join-Path $bundle "FreezeDiscovery_Errors.txt"
+
+$isAdmin = Test-IsAdmin
+
+# System
+$sys = Try-Get -Name "SystemInfo" -ErrFile $errFile -Script { Get-SystemInfo }
+if ($sys) { Write-Json -Path (Join-Path $bundle "SystemInfo.json") -Object $sys -Depth 6 }
+
+# Processes & disks
+Try-Do -Name "TopProcesses" -ErrFile $errFile -Script {
+  Get-ProcessSnapshotTop | Export-Csv (Join-Path $bundle "TopProcesses.csv") -NoTypeInformation -Encoding UTF8 -Force
+} | Out-Null
+
+Try-Do -Name "LogicalDisks" -ErrFile $errFile -Script {
+  Get-LogicalDisks | Export-Csv (Join-Path $bundle "LogicalDisks.csv") -NoTypeInformation -Encoding UTF8 -Force
+} | Out-Null
+
+# Network + GlobalProtect
+$net = Try-Get -Name "Network" -ErrFile $errFile -Script { Get-NetworkSnapshot }
+if ($net) { Write-Json -Path (Join-Path $bundle "Network.json") -Object $net -Depth 10 }
+
+$gp = Try-Get -Name "GlobalProtect" -ErrFile $errFile -Script { Get-GlobalProtectSnapshot }
+if ($gp) { Write-Json -Path (Join-Path $bundle "GlobalProtect.json") -Object $gp -Depth 10 }
+
+# fltmc raw + parsed
+$rawF = Try-Get -Name "fltmc_filters_raw" -ErrFile $errFile -Script { Get-FltmcRaw -Mode "filters" }
+if ($rawF) { $rawF | Out-File (Join-Path $bundle "fltmc_filters_raw.txt") -Encoding UTF8 -Force }
+$filters = @()
+if ($rawF) { $filters = Parse-FltmcFilters -Lines $rawF }
+Write-Json -Path (Join-Path $bundle "MiniFilters.json") -Object $filters -Depth 6
+
+$rawI = Try-Get -Name "fltmc_instances_raw" -ErrFile $errFile -Script { Get-FltmcRaw -Mode "instances" }
+if ($rawI) { $rawI | Out-File (Join-Path $bundle "fltmc_instances_raw.txt") -Encoding UTF8 -Force }
+$instances = @()
+if ($rawI) { $instances = Parse-FltmcInstances -Lines $rawI }
+Write-Json -Path (Join-Path $bundle "MiniFilterInstances.json") -Object $instances -Depth 10
+
+# Events + powercfg
+$events = Try-Get -Name "SystemEvents" -ErrFile $errFile -Script { Get-RelevantSystemEvents -LookbackHours $LookbackHours }
+if (-not $events) { $events = @() }
+$events | Export-Csv (Join-Path $bundle ("SystemEvents_{0}h.csv" -f $LookbackHours)) -NoTypeInformation -Encoding UTF8 -Force
+
+Try-Do -Name "powercfg_lastwake" -ErrFile $errFile -Script {
+  & powercfg /lastwake 2>&1 | Out-File (Join-Path $bundle "powercfg_lastwake.txt") -Encoding UTF8 -Force
+} | Out-Null
+
+# Target + correlation
+$targetCtx = Resolve-TargetContext -TargetPath $TargetPath
+Write-Json -Path (Join-Path $bundle "TargetContext.json") -Object $targetCtx -Depth 8
+
+$volCorr = Build-VolumeCorrelation -TargetCtx $targetCtx -Filters $filters -Instances $instances
+Write-Json -Path (Join-Path $bundle "VolumeCorrelation.json") -Object $volCorr -Depth 12
+
+# Optional tools
+$handleExe  = Find-Tool -FileName "handle.exe"  -ToolRoot $ToolRoot
+$procmonExe = Find-Tool -FileName "procmon.exe" -ToolRoot $ToolRoot
+
+if (-not [string]::IsNullOrWhiteSpace($TargetPath) -and $handleExe) {
+  $handleOut = Join-Path $bundle "HandleSearch.txt"
+  Try-Do -Name "handle_search" -ErrFile $errFile -Script {
+    Run-HandleSearch -HandleExe $handleExe -TargetPath $TargetPath -OutFile $handleOut
+  } | Out-Null
+}
+
+if ($CaptureProcmon -and $procmonExe) {
+  Try-Do -Name "procmon_capture" -ErrFile $errFile -Script {
+    $procmonPml = Run-ProcmonCapture -ProcmonExe $procmonExe -OutFolder $bundle -Seconds $ProcmonSeconds
+  } | Out-Null
+}
+
+# Zip bundle (do before ticket summary so we can include path)
+$zip = $bundle + ".zip"
+if (Test-Path $zip) { Remove-Item $zip -Force }
+Compress-Archive -Path (Join-Path $bundle "*") -DestinationPath $zip -Force
+
+# Routing + reports
+$routing = Compute-Routing -TargetCtx $targetCtx -Gp $gp -Events $events
+
+Write-TicketSummary -Path (Join-Path $bundle "TicketSummary.txt") `
+  -CaseId $CaseId -TargetPath $TargetPath -TargetCtx $targetCtx -VolCorr $volCorr -Events $events `
+  -IsAdmin $isAdmin -Routing $routing -ZipPath $zip
+
+Write-HumanSummary -Path (Join-Path $bundle "Summary_Human.txt") -Sys $sys -TargetCtx $targetCtx -VolCorr $volCorr `
+  -Events $events -IsAdmin $isAdmin -CaseId $CaseId -Routing $routing
+
+Write-VendorReport -MdPath (Join-Path $bundle "VendorReport.md") -TxtPath (Join-Path $bundle "VendorReport.txt") `
+  -Sys $sys -TargetCtx $targetCtx -VolCorr $volCorr -Filters $filters -Instances $instances -Events $events `
+  -IsAdmin $isAdmin -CaseId $CaseId -HandleSearchPath $handleOut -ProcmonPath $procmonPml -Routing $routing -LookbackHours $LookbackHours
+
+Write-Output ("Bundle created: {0}" -f $zip)
+Write-Output ("Routing: {0} (Confidence: {1})" -f $routing.Queue, $routing.Confidence)
+
+if ($ExitCodeMode) {
+  $global:LASTEXITCODE = $(if ($partialFailure) { 1 } else { 0 })
+  exit $global:LASTEXITCODE
+}
+``
+

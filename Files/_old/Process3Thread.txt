@@ -1,0 +1,718 @@
+<#
+.SYNOPSIS
+  FreezeDiscovery - collects evidence for file/app/system freezes; adds volume correlation + human summary + vendor report.
+
+.DESCRIPTION
+  Local-first:
+    - Tools expected in: C:\Temp\Process2Thread (handle.exe, procmon.exe)
+    - Logs/bundles written to: C:\Temp\Process2Thread\FreezeDiscovery
+
+  Captures:
+    - System info (OS/BIOS)
+    - Top processes (CPUSeconds, WorkingSetMB, Handles, Threads)
+    - Logical disks
+    - Network/VPN snapshot
+    - fltmc filters + instances (RAW + parsed JSON)
+    - Relevant System events (41,107,137,129,153) last 48h
+    - powercfg /lastwake
+    - Optional handle.exe search for a target path
+    - Optional Procmon capture to PML backing file
+
+  Produces:
+    - Summary_Human.txt
+    - VendorReport.md and VendorReport.txt
+    - VolumeCorrelation.json
+    - TargetContext.json
+    - ZIP bundle
+
+.PARAMETER TargetPath
+  Optional file/folder path suspected to be locked/frozen (local path or UNC).
+
+.PARAMETER CaseId
+  Optional ticket/case ID included in reports.
+
+.PARAMETER CaptureProcmon
+  If set, captures a short Procmon trace.
+
+.PARAMETER ProcmonSeconds
+  Duration of Procmon capture (default 30s).
+
+#>
+
+[CmdletBinding()]
+param(
+  [string]$TargetPath,
+  [string]$CaseId,
+  [switch]$CaptureProcmon,
+  [ValidateRange(5, 600)]
+  [int]$ProcmonSeconds = 30,
+
+  # Local-first paths per your requirement
+  [string]$ToolRoot   = "C:\Temp\Process2Thread",
+  [string]$OutputRoot = "C:\Temp\Process2Thread\FreezeDiscovery"
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+function New-OutputFolder {
+  if (-not (Test-Path $OutputRoot)) {
+    New-Item -Path $OutputRoot -ItemType Directory -Force | Out-Null
+  }
+  $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+  $out = Join-Path $OutputRoot ("Bundle_{0}" -f $stamp)
+  New-Item -Path $out -ItemType Directory -Force | Out-Null
+  return $out
+}
+
+function Write-Text {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+
+        # IMPORTANT: do NOT use ValidateNotNullOrEmpty here,
+        # because reports legitimately contain blank lines ("")
+        [Parameter(Mandatory=$true)]
+        [string[]]$Lines
+    )
+
+    # Ensure output directory exists
+    $dir = Split-Path -Path $Path -Parent
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+
+    # Write exactly what we're given (including empty strings as blank lines)
+    $Lines | Out-File -FilePath $Path -Encoding UTF8 -Force
+}
+
+function Try-Run {
+  param(
+    [Parameter(Mandatory)][string]$Exe,
+    [Parameter(Mandatory)][string]$Args,
+    [Parameter(Mandatory)][string]$OutFile
+  )
+  try {
+    Start-Process -FilePath $Exe -ArgumentList $Args -NoNewWindow -Wait `
+      -RedirectStandardOutput $OutFile -RedirectStandardError ($OutFile + ".err") | Out-Null
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Test-IsAdmin {
+  try {
+    return ([Security.Principal.WindowsPrincipal] `
+      [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch {
+    return $false
+  }
+}
+
+function Find-ToolPath {
+  param([Parameter(Mandatory)][string]$FileName)
+
+  $candidates = @(
+    (Join-Path $ToolRoot $FileName),
+    (Join-Path $PSScriptRoot $FileName),
+    "$env:ProgramFiles\Sysinternals\$FileName",
+    "$env:ProgramFiles(x86)\Sysinternals\$FileName"
+  )
+
+  $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+function Get-VpnSummary {
+  $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
+  $routes = Get-NetRoute -ErrorAction SilentlyContinue |
+    Where-Object { $_.DestinationPrefix -eq "0.0.0.0/0" } |
+    Sort-Object -Property RouteMetric
+
+  [pscustomobject]@{
+    UpAdapters    = $adapters | Select-Object Name, InterfaceDescription, LinkSpeed
+    DefaultRoutes = $routes   | Select-Object InterfaceAlias, NextHop, RouteMetric
+  }
+}
+
+# --- fltmc capture + parsing ---
+function Get-FltmcRaw {
+  param([Parameter(Mandatory)][ValidateSet('filters','instances')][string]$Mode)
+  # Capture stdout+stderr; raw is critical when parsing yields empty JSON.
+  $raw = & fltmc $Mode 2>&1
+  return ,$raw
+}
+
+function Parse-FltmcFilters {
+  param([string[]]$Lines)
+
+  if (-not $Lines -or $Lines.Count -lt 4) { return @() }
+
+  $entries = $Lines | Select-Object -Skip 3 | Where-Object { $_.Trim() -ne "" }
+  foreach ($line in $entries) {
+    $parts = ($line -split '\s{2,}').Trim()
+    if ($parts.Count -ge 4) {
+      [pscustomobject]@{
+        FilterName = $parts[0]
+        Instances  = [int]$parts[1]
+        Altitude   = $parts[2]
+        Frame      = $parts[3]
+      }
+    }
+  }
+}
+
+function Parse-FltmcInstances {
+  param([string[]]$Lines)
+
+  if (-not $Lines -or $Lines.Count -lt 4) { return @() }
+
+  $entries = $Lines | Select-Object -Skip 3 | Where-Object { $_.Trim() -ne "" }
+  foreach ($line in $entries) {
+    $parts = ($line -split '\s{2,}').Trim()
+    if ($parts.Count -ge 4) {
+      [pscustomobject]@{
+        FilterName = $parts[0]
+        Volume     = $parts[1]
+        Instance   = $parts[2]
+        Altitude   = $parts[3]
+      }
+    }
+  }
+}
+
+function Get-RelevantSystemEvents {
+  param([datetime]$Since)
+  $ids = 41,107,137,129,153
+  Get-WinEvent -FilterHashtable @{ LogName="System"; StartTime=$Since; Id=$ids } -ErrorAction SilentlyContinue |
+    Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message
+}
+
+# --- Target correlation helpers ---
+function Resolve-TargetContext {
+  param([string]$TargetPath)
+
+  $ctx = [ordered]@{
+    TargetPath = $TargetPath
+    PathType   = "None"
+    LocalDrive = $null
+    UncServer  = $null
+    UncShare   = $null
+    Notes      = @()
+  }
+
+  if ([string]::IsNullOrWhiteSpace($TargetPath)) {
+    $ctx.PathType = "None"
+    $ctx.Notes += "No TargetPath provided; volume correlation skipped."
+    return [pscustomobject]$ctx
+  }
+
+  # UNC: \\server\share\...
+  if ($TargetPath -match '^[\\]{2}([^\\]+)\\([^\\]+)') {
+    $ctx.PathType  = "UNC"
+    $ctx.UncServer = $matches[1]
+    $ctx.UncShare  = $matches[2]
+    $ctx.Notes += "UNC path; correlate using VPN/SMB indicators (no drive-letter mapping)."
+    return [pscustomobject]$ctx
+  }
+
+  # Local drive: C:\...
+  try {
+    $qual = Split-Path -Path $TargetPath -Qualifier
+    if ($qual -and $qual -match '^[A-Za-z]:$') {
+      $ctx.PathType   = "Local"
+      $ctx.LocalDrive = $qual.ToUpper()
+      $ctx.Notes += "Local path; correlate using fltmc instances on the drive letter."
+      return [pscustomobject]$ctx
+    }
+  } catch {
+    $ctx.PathType = "Unknown"
+    $ctx.Notes += ("Failed to parse path qualifier: {0}" -f $_.Exception.Message)
+    return [pscustomobject]$ctx
+  }
+
+  $ctx.PathType = "Unknown"
+  $ctx.Notes += "Could not classify TargetPath as Local or UNC."
+  return [pscustomobject]$ctx
+}
+
+function Convert-AltitudeToNumber {
+  param([string]$Altitude)
+  try { return [double]$Altitude } catch { return -1 }
+}
+
+function Build-VolumeCorrelation {
+  param(
+    [Parameter(Mandatory)][pscustomobject]$TargetCtx,
+    [object[]]$Filters,
+    [object[]]$Instances
+  )
+
+  $result = [ordered]@{
+    Target            = $TargetCtx
+    CorrelatedVolume  = $null
+    InstancesOnVolume = @()
+    FiltersOnVolume   = @()
+    Notes             = @()
+  }
+
+  if ($TargetCtx.PathType -eq "Local" -and $TargetCtx.LocalDrive) {
+    $result.CorrelatedVolume = $TargetCtx.LocalDrive
+
+    $instOnVol = @($Instances | Where-Object { $_.Volume -eq $TargetCtx.LocalDrive })
+    $result.InstancesOnVolume = $instOnVol
+
+    $names = @()
+    if ($instOnVol -and $instOnVol.Count -gt 0) {
+      $names = $instOnVol | Select-Object -ExpandProperty FilterName -ErrorAction SilentlyContinue | Sort-Object -Unique
+    }
+
+    $filtersOnVol = @()
+    if ($names -and $names.Count -gt 0) {
+      $filtersOnVol = @($Filters | Where-Object { $names -contains $_.FilterName })
+    }
+
+    $result.FiltersOnVolume = $filtersOnVol | Sort-Object -Property @{Expression={ Convert-AltitudeToNumber $_.Altitude }; Descending=$true}
+
+    if ($instOnVol.Count -eq 0) {
+      $result.Notes += "No instances matched the drive letter. Some systems report volumes as device paths in fltmc output."
+      $result.Notes += "Review fltmc_instances_raw.txt and rerun elevated if needed."
+    }
+
+    return [pscustomobject]$result
+  }
+
+  if ($TargetCtx.PathType -eq "UNC") {
+    $result.CorrelatedVolume = "UNC"
+    $result.Notes += "UNC target: drive-letter volume correlation not applicable; focus on SMB/VPN dependency."
+    return [pscustomobject]$result
+  }
+
+  $result.Notes += "Target not suitable for volume correlation."
+  return [pscustomobject]$result
+}
+
+function Classify-Findings {
+  param(
+    [pscustomobject]$TargetCtx,
+    [pscustomobject]$VolCorr,
+    [object[]]$Filters,
+    [object[]]$Events,
+    [pscustomobject]$VpnObj,
+    [bool]$IsAdmin
+  )
+
+  $flags = New-Object System.Collections.Generic.List[string]
+
+  if (-not $IsAdmin) {
+    $flags.Add("Not running elevated: minifilter enumeration may be incomplete/empty. (Re-run as Administrator for full fltmc visibility)")
+  }
+
+  if ($TargetCtx.PathType -eq "UNC") {
+    $flags.Add("Target is UNC path: likely SMB/VPN/network dependency")
+  }
+
+  if ($Events | Where-Object { $_.Id -eq 129 -or $_.Id -eq 153 }) {
+    $flags.Add("Storage timeouts detected (Event 129/153): likely storage stack/driver/filter involvement")
+  }
+
+  if ($Events | Where-Object { $_.Id -eq 107 -or $_.Id -eq 137 }) {
+    $flags.Add("Power/hibernate events present: possible resume path correlation")
+  }
+
+  $filterNames = @()
+  if ($Filters) {
+    $filterNames = $Filters | Select-Object -ExpandProperty FilterName -ErrorAction SilentlyContinue
+  }
+
+  if ($filterNames -match "WdFilter") {
+    $flags.Add("Defender file system minifilter present (WdFilter)")
+  }
+
+  if ($VolCorr -and $VolCorr.FiltersOnVolume -and @($VolCorr.FiltersOnVolume).Count -gt 0 -and $TargetCtx.PathType -eq "Local") {
+    $top = $VolCorr.FiltersOnVolume | Select-Object -First 5 | ForEach-Object { "$($_.FilterName) (Alt $($_.Altitude))" }
+    $flags.Add(("Filters attached to target volume {0}: {1}" -f $VolCorr.CorrelatedVolume, ($top -join ", ")))
+  }
+
+  $vpnLike = $null
+  try {
+    $vpnLike = $VpnObj.UpAdapters | Where-Object { $_.InterfaceDescription -match "VPN|Virtual|TAP|TUN|WireGuard|GlobalProtect|PANGP|Cisco|AnyConnect" }
+  } catch { $vpnLike = $null }
+
+  if ($vpnLike) {
+    $flags.Add("VPN-like adapter is Up: network file issues may be VPN dependent")
+  }
+
+  if ($flags.Count -eq 0) {
+    $flags.Add("No strong signal found; use bundle for deeper analysis (ProcMon/ETW/WinDbg) and reproduce with controlled tests.")
+  }
+
+  return $flags
+}
+
+function Write-HumanSummary {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [pscustomobject]$TargetCtx,
+    [pscustomobject]$VolCorr,
+    [object[]]$Events,
+    [string[]]$Flags,
+    [bool]$IsAdmin,
+    [string]$CaseId
+  )
+
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("FreezeDiscovery - Human Summary")
+  $lines.Add("----------------------------------------")
+  if ($CaseId) { $lines.Add("Case/Ticket: " + $CaseId) }
+  $lines.Add("Generated: " + (Get-Date).ToString("o"))
+  $lines.Add("Admin context: " + $IsAdmin)
+  $lines.Add("")
+
+  $lines.Add("Target:")
+  $lines.Add("  Path: " + $(if ($TargetCtx -and $TargetCtx.TargetPath) { $TargetCtx.TargetPath } else { "<none>" }))
+  $lines.Add("  Type: " + $(if ($TargetCtx -and $TargetCtx.PathType) { $TargetCtx.PathType } else { "<unknown>" }))
+
+  if ($TargetCtx -and $TargetCtx.PathType -eq "Local") {
+    $lines.Add("  Drive: " + $(if ($TargetCtx.LocalDrive) { $TargetCtx.LocalDrive } else { "<unknown>" }))
+  } elseif ($TargetCtx -and $TargetCtx.PathType -eq "UNC") {
+    $unc = "\\{0}\{1}" -f $TargetCtx.UncServer, $TargetCtx.UncShare
+    $lines.Add("  UNC: " + $unc)
+  }
+
+  $lines.Add("")
+  $lines.Add("Key Findings:")
+  if ($Flags -and $Flags.Count -gt 0) {
+    foreach ($f in $Flags) { $lines.Add("  - " + $f) }
+  } else {
+    $lines.Add("  - <no findings>")
+  }
+  $lines.Add("")
+
+  if ($TargetCtx -and $TargetCtx.PathType -eq "Local") {
+    $lines.Add("Volume Correlation (local):")
+    $lines.Add("  Correlated volume: " + $(if ($VolCorr -and $VolCorr.CorrelatedVolume) { $VolCorr.CorrelatedVolume } else { "<unknown>" }))
+    $lines.Add("  Minifilter instances on volume: " + $(if ($VolCorr -and $VolCorr.InstancesOnVolume) { @($VolCorr.InstancesOnVolume).Count } else { 0 }))
+    $lines.Add("  Filters on volume (sorted by altitude, highest first):")
+
+    if ($VolCorr -and $VolCorr.FiltersOnVolume -and @($VolCorr.FiltersOnVolume).Count -gt 0) {
+      foreach ($flt in ($VolCorr.FiltersOnVolume | Select-Object -First 10)) {
+        $lines.Add(("    - {0} (Altitude {1})" -f $flt.FilterName, $flt.Altitude))
+      }
+    } else {
+      $lines.Add("    - <none matched> (See fltmc raw outputs; may require elevation or device-path mapping)")
+    }
+
+    $lines.Add("")
+  }
+
+  $recent129 = @()
+  $recent153 = @()
+  if ($Events) {
+    $recent129 = @($Events | Where-Object { $_.Id -eq 129 } | Select-Object -First 3)
+    $recent153 = @($Events | Where-Object { $_.Id -eq 153 } | Select-Object -First 3)
+  }
+
+  if ($recent129.Count -gt 0 -or $recent153.Count -gt 0) {
+    $lines.Add("Storage Timeout Indicators (sample):")
+    foreach ($e in $recent129) { $lines.Add("  - " + $e.TimeCreated + " ID 129 " + $e.ProviderName) }
+    foreach ($e in $recent153) { $lines.Add("  - " + $e.TimeCreated + " ID 153 " + $e.ProviderName) }
+    $lines.Add("")
+  }
+
+  $lines.Add("Safe Next Steps:")
+  $lines.Add("  1) If UNC/VPN suspected: reproduce once with VPN disconnected (if policy allows) and capture a second bundle.")
+  $lines.Add("  2) If storage timeout events exist (129/153): escalate to Endpoint/Platform; include this bundle.")
+  $lines.Add("  3) If file-specific: ensure HandleSearch.txt exists (requires handle.exe) and attach it.")
+  $lines.Add("  4) If repeatable and brief: capture Procmon for 30-60 seconds during reproduction (opt-in).")
+  $lines.Add("")
+
+  Write-Text -Path $Path -Lines $lines.ToArray()
+}
+
+# -----------------------------
+# PS 5.1-safe Vendor Report
+# -----------------------------
+function Write-VendorReport {
+    param(
+        [string]$MdPath,
+        [string]$TxtPath,
+        [pscustomobject]$Sys,
+        [pscustomobject]$TargetCtx,
+        [pscustomobject]$VolCorr,
+        [object[]]$Filters,
+        [object[]]$Instances,
+        [object[]]$Events,
+        [string[]]$Flags,
+        [bool]$IsAdmin,
+        [string]$CaseId,
+        [string]$HandleSearchPath,
+        [string]$ProcmonPath
+    )
+
+    # -----------------------------
+    # Local helpers (function scope)
+    # -----------------------------
+
+    $md = New-Object System.Collections.Generic.List[string]
+
+    function Add-MdLine {
+        param([string]$Text)
+        [void]$md.Add($Text)
+    }
+
+    function Safe-Val {
+        param([object]$Value, [string]$Fallback)
+        if ($null -eq $Value) { return $Fallback }
+        $s = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($s)) { return $Fallback }
+        return $s
+    }
+
+    function Path-Exists {
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+        return (Test-Path $Path)
+    }
+
+    # -----------------------------
+    # Build report
+    # -----------------------------
+
+    Add-MdLine "# Vendor Diagnostic Report"
+    Add-MdLine ""
+
+    if ($CaseId) {
+        Add-MdLine ("**Case ID:** {0}  " -f $CaseId)
+    }
+
+    Add-MdLine ("**Generated:** {0}  " -f (Get-Date).ToString("o"))
+    Add-MdLine ("**Admin context:** {0}  " -f $IsAdmin)
+    Add-MdLine ""
+
+    Add-MdLine "## 1. Executive Summary"
+
+    if ($Flags -and $Flags.Count -gt 0) {
+        foreach ($f in $Flags) {
+            Add-MdLine ("- {0}" -f $f)
+        }
+    }
+    else {
+        Add-MdLine "- No dominant signal detected; see evidence sections."
+    }
+
+    Add-MdLine ""
+    Add-MdLine "## 2. Target Context"
+
+    Add-MdLine ("- **TargetPath:** {0}" -f (Safe-Val $TargetCtx.TargetPath "<none>"))
+    Add-MdLine ("- **PathType:** {0}" -f (Safe-Val $TargetCtx.PathType "<unknown>"))
+
+    if ($TargetCtx.PathType -eq "Local") {
+        Add-MdLine ("- **Local drive:** {0}" -f (Safe-Val $TargetCtx.LocalDrive "<unknown>"))
+    }
+    elseif ($TargetCtx.PathType -eq "UNC") {
+        Add-MdLine ("- **UNC path:** \\{0}\{1}" -f $TargetCtx.UncServer, $TargetCtx.UncShare)
+    }
+
+    Add-MdLine ""
+    Add-MdLine "## 3. Minifilter Evidence"
+
+    Add-MdLine ("- Loaded minifilters: {0}" -f (@($Filters).Count))
+    Add-MdLine ("- Filter instances: {0}" -f (@($Instances).Count))
+
+    if ($VolCorr -and $VolCorr.FiltersOnVolume -and $VolCorr.FiltersOnVolume.Count -gt 0) {
+        Add-MdLine ""
+        Add-MdLine "**Filters on affected volume:**"
+        foreach ($f in $VolCorr.FiltersOnVolume) {
+            Add-MdLine ("- {0} (Altitude {1})" -f $f.FilterName, $f.Altitude)
+        }
+    }
+
+    Add-MdLine ""
+    Add-MdLine "## 4. File Lock Evidence"
+
+    if (Path-Exists $HandleSearchPath) {
+        Add-MdLine "- HandleSearch.txt included (user-mode handle ownership)."
+    }
+    else {
+        Add-MdLine "- No user-mode handle owner found or handle.exe unavailable."
+    }
+
+    Add-MdLine ""
+    Add-MdLine "## 5. Procmon Evidence"
+
+    if (Path-Exists $ProcmonPath) {
+        Add-MdLine "- Procmon trace captured (ProcmonTrace.pml)."
+    }
+    else {
+        Add-MdLine "- Procmon trace not captured in this run."
+    }
+
+    Add-MdLine ""
+    Add-MdLine "## 6. Vendor Action Requested"
+    Add-MdLine "- Review minifilter behavior on the affected volume."
+    Add-MdLine "- Validate driver behavior across resume / I/O stress."
+    Add-MdLine "- Confirm whether any filter delays IRP completion."
+
+    # -----------------------------
+    # Write files
+    # -----------------------------
+
+    $mdText = ($md -join "`r`n")
+    $mdText | Out-File -FilePath $MdPath -Encoding UTF8 -Force
+
+    $txtText = $mdText -replace '\*\*', '' -replace '_', ''
+    $txtText | Out-File -FilePath $TxtPath -Encoding UTF8 -Force
+}
+
+function Invoke-ProcmonCapture {
+  param(
+    [Parameter(Mandatory)][string]$ProcmonPath,
+    [Parameter(Mandatory)][string]$OutFolder,
+    [int]$Seconds = 30
+  )
+  $pml = Join-Path $OutFolder "ProcmonTrace.pml"
+
+  # /AcceptEula avoids interactive prompts; /BackingFile writes to .pml
+  $argsStart = "/AcceptEula /Quiet /Minimized /BackingFile `"$pml`""
+  Start-Process -FilePath $ProcmonPath -ArgumentList $argsStart -WindowStyle Hidden | Out-Null
+
+  Start-Sleep -Seconds $Seconds
+
+  # Stop procmon
+  Start-Process -FilePath $ProcmonPath -ArgumentList "/Terminate" -WindowStyle Hidden -Wait | Out-Null
+  return $pml
+}
+
+# -----------------------------
+# MAIN
+# -----------------------------
+
+$out = New-OutputFolder
+$IsAdmin = Test-IsAdmin
+
+# System identity + OS/BIOS
+$sys = [pscustomobject]@{
+  ComputerName = $env:COMPUTERNAME
+  UserName     = $env:USERNAME
+  TimeLocal    = (Get-Date).ToString("o")
+  OS           = (Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber)
+  BIOS         = (Get-CimInstance Win32_BIOS | Select-Object SMBIOSBIOSVersion, Manufacturer, ReleaseDate)
+}
+$sys | ConvertTo-Json -Depth 6 | Out-File (Join-Path $out "SystemInfo.json") -Encoding UTF8 -Force
+
+# Robust top-process snapshot (avoids Sort-Object CPU crash)
+Get-Process |
+  Select-Object Name, Id,
+    @{Name='CPUSeconds';Expression={ if ($null -eq $_.CPU) {0} else {[double]$_.CPU} }},
+    @{Name='WorkingSetMB';Expression={[math]::Round($_.WorkingSet64/1MB,1)}},
+    @{Name='Handles';Expression={$_.Handles}},
+    @{Name='Threads';Expression={$_.Threads.Count}},
+    Responding |
+  Sort-Object -Property CPUSeconds -Descending |
+  Select-Object -First 30 |
+  Export-Csv (Join-Path $out "TopProcesses.csv") -NoTypeInformation -Encoding UTF8 -Force
+
+# Logical disks
+Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID, DriveType, Size, FreeSpace |
+  Export-Csv (Join-Path $out "LogicalDisks.csv") -NoTypeInformation -Encoding UTF8 -Force
+
+# Network/VPN snapshot
+$vpn = Get-VpnSummary
+$vpn | ConvertTo-Json -Depth 8 | Out-File (Join-Path $out "NetworkVpn.json") -Encoding UTF8 -Force
+
+# fltmc raw + parse
+$rawFilters = Get-FltmcRaw -Mode filters
+$rawFilters | Out-File (Join-Path $out "fltmc_filters_raw.txt") -Encoding UTF8 -Force
+
+$rawInst = Get-FltmcRaw -Mode instances
+$rawInst | Out-File (Join-Path $out "fltmc_instances_raw.txt") -Encoding UTF8 -Force
+
+$filters   = Parse-FltmcFilters -Lines $rawFilters
+$instances = Parse-FltmcInstances -Lines $rawInst
+
+$filters   | ConvertTo-Json -Depth 6 | Out-File (Join-Path $out "MiniFilters.json") -Encoding UTF8 -Force
+$instances | ConvertTo-Json -Depth 8 | Out-File (Join-Path $out "MiniFilterInstances.json") -Encoding UTF8 -Force
+
+if (-not $filters -or @($filters).Count -eq 0 -or -not $instances -or @($instances).Count -eq 0) {
+  $warn = @(
+    "MiniFilter outputs may be empty/incomplete.",
+    ("Admin context: {0}" -f $IsAdmin),
+    "Review fltmc_filters_raw.txt and fltmc_instances_raw.txt for the exact command output.",
+    "If raw output indicates access restrictions, re-run PowerShell as Administrator."
+  )
+  Write-Text -Path (Join-Path $out "MiniFilter_WARNING.txt") -Lines $warn
+}
+
+# Events (last 48h)
+$since = (Get-Date).AddHours(-48)
+$events = Get-RelevantSystemEvents -Since $since
+$events | Export-Csv (Join-Path $out "SystemEvents_48h.csv") -NoTypeInformation -Encoding UTF8 -Force
+
+# powercfg /lastwake
+Try-Run -Exe "powercfg.exe" -Args "/lastwake" -OutFile (Join-Path $out "powercfg_lastwake.txt") | Out-Null
+
+# Tool lookup
+$handleExe = Find-ToolPath -FileName "handle.exe"
+$procmonExe = Find-ToolPath -FileName "procmon.exe"
+
+# Optional Procmon capture
+$procmonPml = $null
+if ($CaptureProcmon) {
+  if ($procmonExe) {
+    $procmonPml = Invoke-ProcmonCapture -ProcmonPath $procmonExe -OutFolder $out -Seconds $ProcmonSeconds
+  } else {
+    Write-Text -Path (Join-Path $out "ProcmonTrace.txt") -Lines @(
+      "Procmon capture requested but procmon.exe was not found.",
+      "Place procmon.exe in C:\Temp\Process2Thread and rerun with -CaptureProcmon."
+    )
+  }
+}
+
+# Optional handle owner search
+$handleOut = $null
+if (-not [string]::IsNullOrWhiteSpace($TargetPath)) {
+  $handleOut = Join-Path $out "HandleSearch.txt"
+  if ($handleExe) {
+    & $handleExe -accepteula $TargetPath 2>&1 | Out-File $handleOut -Encoding UTF8 -Force
+  } else {
+	  
+    Write-Text -Path $handleOut -Lines @(
+      ("TargetPath provided: {0}" -f $TargetPath),
+      "handle.exe not found. Place handle.exe in C:\Temp\Process2Thread and rerun for lock-owner discovery."
+    )
+  }
+}
+
+# Target context + volume correlation
+$targetCtx = Resolve-TargetContext -TargetPath $TargetPath
+$targetCtx | ConvertTo-Json -Depth 8 | Out-File (Join-Path $out "TargetContext.json") -Encoding UTF8 -Force
+
+$volCorr = Build-VolumeCorrelation -TargetCtx $targetCtx -Filters $filters -Instances $instances
+$volCorr | ConvertTo-Json -Depth 10 | Out-File (Join-Path $out "VolumeCorrelation.json") -Encoding UTF8 -Force
+
+# Findings + reports
+$flags = Classify-Findings -TargetCtx $targetCtx -VolCorr $volCorr -Filters $filters -Events $events -VpnObj $vpn -IsAdmin $IsAdmin
+
+Write-HumanSummary -Path (Join-Path $out "Summary_Human.txt") -TargetCtx $targetCtx -VolCorr $volCorr 
+  -Events $events -Flags $flags -IsAdmin $IsAdmin -CaseId $CaseId
+
+Write-VendorReport -MdPath (Join-Path $out "VendorReport.md") -TxtPath (Join-Path $out "VendorReport.txt") `
+  -Sys $sys -TargetCtx $targetCtx -VolCorr $volCorr -Filters $filters -Instances $instances -Events $events `
+  -Flags $flags -IsAdmin $IsAdmin -CaseId $CaseId -HandleSearchPath $handleOut -ProcmonPath $procmonPml
+
+# Zip bundle
+$zipPath = $out + ".zip"
+if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+Compress-Archive -Path (Join-Path $out "*") -DestinationPath $zipPath -Force
+
+Write-Output "FreezeDiscovery bundle created: $zipPath"
+Write-Output "Summary:"
+$flags | ForEach-Object { Write-Output (" - " + $_) }
+
+exit 0
